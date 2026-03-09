@@ -1,4 +1,5 @@
 import json
+import os
 import re
 import sys
 import unittest
@@ -14,6 +15,10 @@ try:
 except ModuleNotFoundError:
     st = None
 
+
+DATASET_PATH = "/mnt/data/train_small_1000_en_LABELED_3THEMES_semantic_clean.csv"
+DEFAULT_CONFIDENCE_THRESHOLD = 0.60
+HUMAN_REVIEW_THRESHOLD = 0.45
 
 THEMES = {
     "livraison": [
@@ -102,8 +107,16 @@ NEGATIVE_WORDS = {
 }
 
 RARE_THEMES = {"livraison", "sav"}
-DEFAULT_CONFIDENCE_THRESHOLD = 0.60
-HUMAN_REVIEW_THRESHOLD = 0.45
+THEME_LABELS = {
+    "livraison": "Livraison",
+    "sav": "SAV",
+    "produit": "Produit",
+}
+SENTIMENT_LABELS = {
+    -1: "négatif",
+    0: "neutre",
+    1: "positif",
+}
 
 
 @dataclass
@@ -113,6 +126,9 @@ class ThemeResult:
     confidence: float
 
 
+# =========================
+# MOTEUR D'ANALYSE POC
+# =========================
 def normalize_text(text: str) -> str:
     text = str(text).lower().strip()
     text = re.sub(r"\s+", " ", text)
@@ -131,11 +147,7 @@ def detect_themes(text: str, threshold: float) -> Dict[str, ThemeResult]:
         hits = keyword_hits(text, keywords)
         confidence = min(0.2 + hits * 0.22, 0.98) if hits > 0 else 0.08
         present = int(confidence >= threshold)
-        results[theme] = ThemeResult(
-            present=present,
-            sentiment=None,
-            confidence=round(confidence, 2),
-        )
+        results[theme] = ThemeResult(present=present, sentiment=None, confidence=round(confidence, 2))
     return results
 
 
@@ -191,13 +203,13 @@ def human_review_needed(theme_results: Dict[str, ThemeResult], original_text: st
 def build_actionable_text(theme: str, sentiment: Optional[str]) -> str:
     if sentiment == "négatif":
         mapping = {
-            "livraison": "Prioriser une alerte logistique et vérifier les délais / dommages colis.",
+            "livraison": "Alerter la logistique et vérifier délai, transporteur et état du colis.",
             "sav": "Escalader au support client et suivre le temps de résolution.",
-            "produit": "Analyser le défaut produit et ouvrir une boucle qualité / catalogue.",
+            "produit": "Ouvrir une boucle qualité pour défaut produit, fiche article ou packaging.",
         }
         return mapping.get(theme, "Déclencher une revue opérationnelle.")
     if sentiment == "positif":
-        return f"Capitaliser sur les retours positifs liés à {theme} dans les insights CX."
+        return f"Valoriser les retours positifs liés au thème {theme} dans les insights CX."
     return f"Surveiller le thème {theme} sans action urgente."
 
 
@@ -232,11 +244,12 @@ def analyze_review(text: str, review_id: str, threshold: float = DEFAULT_CONFIDE
                 "topic": "autre",
                 "sentiment": global_sentiment,
                 "confidence": sent_conf,
-                "actionable_text": "Classer en backlog pour enrichir la taxonomie métier.",
+                "actionable_text": "Classer cet avis dans le backlog pour enrichir la taxonomie métier.",
             }
         )
 
     score_global = round(sum(sentiment_scores) / len(sentiment_scores), 2) if sentiment_scores else 0.50
+    global_sentiment = insights[0]["sentiment"] if insights else "neutre"
 
     payload = {
         "review_id": review_id,
@@ -244,8 +257,9 @@ def analyze_review(text: str, review_id: str, threshold: float = DEFAULT_CONFIDE
         "themes_detected": detected_themes,
         "insights": insights,
         "score_global": score_global,
+        "global_sentiment": global_sentiment,
         "needs_human_review": needs_review,
-        "model_version": "poc-rules-v2-premium-ui",
+        "model_version": "poc-fr-v3-ux-ui",
     }
 
     for theme in THEMES:
@@ -308,23 +322,6 @@ def flatten_export(results_df: pd.DataFrame) -> pd.DataFrame:
 
 
 
-def build_sample_data() -> pd.DataFrame:
-    return pd.DataFrame(
-        {
-            "review_id": ["R-001", "R-002", "R-003", "R-004", "R-005", "R-006"],
-            "review_text": [
-                "La livraison est arrivée en retard et le carton était abîmé.",
-                "Le produit est excellent, très bonne qualité.",
-                "Le service client n'a jamais répondu à ma demande de remboursement.",
-                "Produit correct mais support lent et retour compliqué.",
-                "Livraison rapide et produit conforme, super expérience.",
-                "Le colis est arrivé, mais le produit semble défectueux.",
-            ],
-        }
-    )
-
-
-
 def safe_read_csv_filelike(file_obj):
     try:
         return pd.read_csv(file_obj)
@@ -337,12 +334,69 @@ def safe_read_csv_filelike(file_obj):
 
 
 
+def find_text_column(df: pd.DataFrame) -> str:
+    priorities = ["review_body", "review_text", "text_norm", "review_title", "text"]
+    for col in priorities:
+        if col in df.columns:
+            return col
+    return df.columns[0]
+
+
+
+def find_id_column(df: pd.DataFrame) -> Optional[str]:
+    for col in ["review_id", "id"]:
+        if col in df.columns:
+            return col
+    return None
+
+
+
+def load_poc_dataset() -> pd.DataFrame:
+    if os.path.exists(DATASET_PATH):
+        return pd.read_csv(DATASET_PATH)
+    return pd.DataFrame(
+        {
+            "review_id": ["R-001", "R-002", "R-003"],
+            "review_body": [
+                "The delivery was late and the package was damaged.",
+                "The product is excellent and the quality is great.",
+                "Customer service never answered my refund request.",
+            ],
+            "sent_global": [-1, 1, -1],
+            "theme_livraison": [1, 0, 0],
+            "theme_sav": [0, 0, 1],
+            "theme_produit": [0, 1, 0],
+        }
+    )
+
+
+
+def prepare_demo_dataset(df: pd.DataFrame) -> pd.DataFrame:
+    prepared = df.copy()
+    if "review_body" not in prepared.columns and "review_text" in prepared.columns:
+        prepared["review_body"] = prepared["review_text"]
+    if "review_title" not in prepared.columns:
+        prepared["review_title"] = ""
+    if "sent_global" in prepared.columns:
+        prepared["sentiment_fr"] = prepared["sent_global"].map(SENTIMENT_LABELS).fillna("neutre")
+    else:
+        prepared["sentiment_fr"] = "neutre"
+    for theme in THEMES:
+        theme_col = f"theme_{theme}"
+        if theme_col not in prepared.columns:
+            prepared[theme_col] = 0
+    return prepared
+
+
+# =========================
+# UI STREAMLIT
+# =========================
 def configure_page() -> None:
     if st is None:
         return
     st.set_page_config(
-        page_title="Review Insights+ | MVP Studio",
-        page_icon="✨",
+        page_title="POC Analyse des Avis Clients",
+        page_icon="💬",
         layout="wide",
         initial_sidebar_state="expanded",
     )
@@ -357,117 +411,106 @@ def inject_styles() -> None:
         <style>
             .stApp {
                 background:
-                    radial-gradient(circle at top left, rgba(110, 87, 224, 0.22), transparent 28%),
-                    radial-gradient(circle at top right, rgba(17, 153, 142, 0.16), transparent 24%),
-                    linear-gradient(180deg, #0b1020 0%, #11182d 52%, #0d1325 100%);
-                color: #f4f7fb;
+                    radial-gradient(circle at top left, rgba(88, 97, 246, 0.16), transparent 26%),
+                    radial-gradient(circle at top right, rgba(16, 185, 129, 0.14), transparent 24%),
+                    linear-gradient(180deg, #f7f9fc 0%, #edf2f8 100%);
+                color: #142033;
             }
             .block-container {
-                padding-top: 1.2rem;
+                max-width: 1380px;
+                padding-top: 1rem;
                 padding-bottom: 2rem;
-                max-width: 1440px;
             }
             [data-testid="stSidebar"] {
-                background: linear-gradient(180deg, rgba(10,16,32,0.96), rgba(16,24,45,0.98));
-                border-right: 1px solid rgba(255,255,255,0.08);
+                background: linear-gradient(180deg, #ffffff 0%, #f5f8fc 100%);
+                border-right: 1px solid rgba(20, 32, 51, 0.08);
             }
-            [data-testid="stMetric"] {
-                background: linear-gradient(180deg, rgba(255,255,255,0.10), rgba(255,255,255,0.06));
-                border: 1px solid rgba(255,255,255,0.10);
-                border-radius: 18px;
-                padding: 14px 16px;
-                backdrop-filter: blur(10px);
-            }
-            div[data-testid="stMetricValue"] { color: #ffffff; }
-            div[data-testid="stMetricLabel"] { color: #aab6d3; }
-            .hero-card {
-                padding: 1.45rem 1.5rem;
-                border-radius: 24px;
-                border: 1px solid rgba(255,255,255,0.08);
-                background: linear-gradient(135deg, rgba(255,255,255,0.12), rgba(255,255,255,0.05));
-                box-shadow: 0 24px 80px rgba(0,0,0,0.28);
-                backdrop-filter: blur(18px);
+            .hero {
+                padding: 1.6rem 1.6rem;
+                border-radius: 26px;
+                background: linear-gradient(135deg, #162033 0%, #24344d 60%, #324b6b 100%);
+                color: white;
+                box-shadow: 0 20px 60px rgba(19, 31, 49, 0.22);
                 margin-bottom: 1rem;
             }
-            .glass-card {
-                padding: 1rem 1.1rem;
-                border-radius: 20px;
-                border: 1px solid rgba(255,255,255,0.08);
-                background: linear-gradient(180deg, rgba(255,255,255,0.08), rgba(255,255,255,0.04));
-                box-shadow: 0 18px 42px rgba(0,0,0,0.18);
-                margin-bottom: 1rem;
-            }
-            .section-title {
+            .hero-kicker {
                 font-size: 0.82rem;
                 text-transform: uppercase;
-                letter-spacing: 0.14em;
-                color: #8ea0c9;
-                margin-bottom: 0.35rem;
+                letter-spacing: 0.16em;
+                opacity: 0.8;
                 font-weight: 700;
             }
-            .headline {
-                font-size: 2.2rem;
+            .hero-title {
+                font-size: 2.3rem;
                 font-weight: 800;
-                line-height: 1.1;
-                color: #ffffff;
-                margin-bottom: 0.4rem;
+                margin-top: 0.4rem;
+                line-height: 1.08;
             }
-            .subtle { color: #b7c2da; font-size: 1rem; }
-            .pill {
+            .hero-sub {
+                margin-top: 0.65rem;
+                color: rgba(255,255,255,0.86);
+                font-size: 1rem;
+                max-width: 900px;
+            }
+            .surface-card {
+                background: rgba(255,255,255,0.9);
+                border: 1px solid rgba(17,24,39,0.08);
+                box-shadow: 0 10px 30px rgba(18, 33, 57, 0.08);
+                border-radius: 22px;
+                padding: 1rem 1rem;
+                margin-bottom: 1rem;
+            }
+            .theme-card {
+                border-radius: 20px;
+                padding: 1rem 1rem;
+                border: 1px solid rgba(17,24,39,0.08);
+                background: white;
+                box-shadow: 0 8px 24px rgba(18, 33, 57, 0.06);
+                min-height: 170px;
+            }
+            .theme-ok {
+                border-left: 6px solid #10b981;
+            }
+            .theme-bad {
+                border-left: 6px solid #ef4444;
+            }
+            .theme-neutral {
+                border-left: 6px solid #94a3b8;
+            }
+            .theme-off {
+                border-left: 6px solid #e2e8f0;
+                opacity: 0.76;
+            }
+            .badge {
                 display: inline-block;
                 padding: 0.35rem 0.7rem;
                 border-radius: 999px;
+                font-weight: 700;
+                font-size: 0.84rem;
                 margin-right: 0.45rem;
                 margin-bottom: 0.45rem;
-                font-size: 0.84rem;
-                font-weight: 600;
-                border: 1px solid rgba(255,255,255,0.08);
-                background: rgba(255,255,255,0.06);
-                color: #e8ecf8;
             }
-            .insight-positive,
-            .insight-negative,
-            .insight-neutral {
-                border-radius: 18px;
-                padding: 1rem 1rem;
-                margin-bottom: 0.75rem;
-                border: 1px solid rgba(255,255,255,0.10);
-                box-shadow: 0 14px 34px rgba(0,0,0,0.16);
-            }
-            .insight-positive { background: linear-gradient(135deg, rgba(25,135,84,0.24), rgba(255,255,255,0.04)); }
-            .insight-negative { background: linear-gradient(135deg, rgba(220,53,69,0.26), rgba(255,255,255,0.04)); }
-            .insight-neutral { background: linear-gradient(135deg, rgba(13,110,253,0.24), rgba(255,255,255,0.04)); }
-            .mini-kpi {
-                border-radius: 16px;
-                padding: 0.9rem 1rem;
-                background: rgba(255,255,255,0.05);
-                border: 1px solid rgba(255,255,255,0.07);
-                margin-bottom: 0.8rem;
-            }
-            .mini-kpi-label {
-                color: #93a5cc;
-                font-size: 0.8rem;
-                text-transform: uppercase;
-                letter-spacing: 0.12em;
-            }
-            .mini-kpi-value {
-                color: #ffffff;
-                font-size: 1.5rem;
+            .badge-pos { background: #dcfce7; color: #166534; }
+            .badge-neg { background: #fee2e2; color: #991b1b; }
+            .badge-neu { background: #e2e8f0; color: #334155; }
+            .badge-theme { background: #dbeafe; color: #1d4ed8; }
+            .section-title {
+                font-size: 1.05rem;
                 font-weight: 800;
-                margin-top: 0.15rem;
+                color: #162033;
+                margin-bottom: 0.7rem;
             }
-            .streamlit-expanderHeader { background: rgba(255,255,255,0.04); border-radius: 14px; }
-            .stTabs [data-baseweb="tab-list"] { gap: 0.5rem; }
-            .stTabs [data-baseweb="tab"] {
-                background: rgba(255,255,255,0.05);
-                border-radius: 12px;
-                padding: 0.55rem 1rem;
-                color: #dfe7fb;
+            .helper {
+                color: #5b6b81;
+                font-size: 0.96rem;
             }
-            .stTabs [aria-selected="true"] {
-                background: linear-gradient(135deg, rgba(110,87,224,0.40), rgba(45,128,255,0.32));
+            div[data-testid="stMetric"] {
+                background: white;
+                border: 1px solid rgba(17,24,39,0.08);
+                border-radius: 18px;
+                padding: 0.75rem 0.85rem;
+                box-shadow: 0 8px 24px rgba(18, 33, 57, 0.05);
             }
-            .footer-note { text-align: center; color: #91a1c7; padding: 0.4rem 0 0.8rem 0; }
         </style>
         """,
         unsafe_allow_html=True,
@@ -475,37 +518,52 @@ def inject_styles() -> None:
 
 
 
-def metric_card(label: str, value, help_text: Optional[str] = None) -> None:
-    st.metric(label=label, value=value, help=help_text)
+def sentiment_badge(sentiment: str) -> str:
+    if sentiment == "positif":
+        return '<span class="badge badge-pos">Positif</span>'
+    if sentiment == "négatif":
+        return '<span class="badge badge-neg">Négatif</span>'
+    return '<span class="badge badge-neu">Neutre</span>'
 
 
 
-def mini_kpi(label: str, value: str) -> None:
+def theme_badge(label: str) -> str:
+    return f'<span class="badge badge-theme">{label}</span>'
+
+
+
+def render_header(df_demo: pd.DataFrame) -> None:
     st.markdown(
         f"""
-        <div class="mini-kpi">
-            <div class="mini-kpi-label">{label}</div>
-            <div class="mini-kpi-value">{value}</div>
+        <div class="hero">
+            <div class="hero-kicker">POC / MVP en français</div>
+            <div class="hero-title">Analyse des commentaires clients par thème et sentiment</div>
+            <div class="hero-sub">Écrivez un commentaire et obtenez immédiatement une lecture claire : thème détecté, sentiment, niveau de confiance et action recommandée. Le POC s'appuie aussi sur le fichier fourni pour la démonstration et le dashboard.</div>
         </div>
         """,
         unsafe_allow_html=True,
     )
+    a, b, c, d = st.columns(4)
+    with a:
+        st.metric("Commentaires du fichier", len(df_demo))
+    with b:
+        st.metric("Commentaires livraison", int(df_demo["theme_livraison"].sum()))
+    with c:
+        st.metric("Commentaires SAV", int(df_demo["theme_sav"].sum()))
+    with d:
+        st.metric("Commentaires produit", int(df_demo["theme_produit"].sum()))
 
 
 
-def render_header() -> None:
+def render_analysis_summary(result: Dict) -> None:
+    themes = result["themes_detected"] or ["autre"]
+    badges = "".join(theme_badge(THEME_LABELS.get(t, t.title())) for t in themes)
     st.markdown(
-        """
-        <div class="hero-card">
-            <div class="section-title">Customer Intelligence Platform</div>
-            <div class="headline">Review Insights+ — MVP Studio</div>
-            <div class="subtle">Un prototype premium pour transformer des avis clients en signaux actionnables, priorités opérationnelles et exports prêts à brancher dans une stack IA de production.</div>
-            <div style="margin-top: 1rem;">
-                <span class="pill">Multi-thèmes</span>
-                <span class="pill">Sentiment par insight</span>
-                <span class="pill">Human review queue</span>
-                <span class="pill">Dashboard exécutif</span>
-            </div>
+        f"""
+        <div class="surface-card">
+            <div class="section-title">Résultat instantané</div>
+            <div style="margin-bottom:0.5rem;">{sentiment_badge(result['global_sentiment'])}{badges}</div>
+            <div class="helper">Score global : <b>{result['score_global']}</b> · Revue humaine : <b>{'Oui' if result['needs_human_review'] else 'Non'}</b></div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -513,66 +571,60 @@ def render_header() -> None:
 
 
 
-def render_single_result(result: Dict) -> None:
-    st.markdown('<div class="glass-card">', unsafe_allow_html=True)
-    st.markdown(f"### Analyse premium — {result['review_id']}")
-    st.write(result["review_text"])
+def render_theme_cards(result: Dict) -> None:
+    cols = st.columns(3)
+    for idx, theme in enumerate(["livraison", "sav", "produit"]):
+        theme_label = THEME_LABELS[theme]
+        is_present = result[f"theme_{theme}"] == 1
+        sentiment = result.get(f"sent_{theme}") or "non détecté"
+        confidence = result.get(f"conf_{theme}", 0)
+        action = build_actionable_text(theme, result.get(f"sent_{theme}")) if is_present else "Aucun signal fort détecté sur ce thème."
 
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        metric_card("Score global", result["score_global"])
-    with col2:
-        metric_card("Thèmes détectés", len(result["themes_detected"]))
-    with col3:
-        metric_card("Revue humaine", "Oui" if result["needs_human_review"] else "Non")
+        css_class = "theme-off"
+        if is_present and sentiment == "positif":
+            css_class = "theme-ok"
+        elif is_present and sentiment == "négatif":
+            css_class = "theme-bad"
+        elif is_present:
+            css_class = "theme-neutral"
 
-    st.markdown("#### Insights actionnables")
-    for insight in result["insights"]:
-        sentiment = insight["sentiment"] or "neutre"
-        css_class = "insight-neutral"
-        if sentiment == "négatif":
-            css_class = "insight-negative"
-        elif sentiment == "positif":
-            css_class = "insight-positive"
-        icon = "🧭"
-        if sentiment == "négatif":
-            icon = "🚨"
-        elif sentiment == "positif":
-            icon = "✨"
-
-        st.markdown(
+        cols[idx].markdown(
             f"""
-            <div class="{css_class}">
-                <div style="font-weight: 800; color: #ffffff; margin-bottom: 0.25rem;">{icon} {insight['topic'].title()}</div>
-                <div style="color: #d9e2f7; margin-bottom: 0.35rem;">Sentiment: <b>{sentiment}</b> · Confiance: <b>{insight['confidence']}</b></div>
-                <div style="color: #f2f5fc;">{insight['actionable_text']}</div>
+            <div class="theme-card {css_class}">
+                <div style="font-size:1.08rem;font-weight:800;color:#142033;">{theme_label}</div>
+                <div style="margin-top:0.45rem;color:#334155;"><b>Détection :</b> {'Oui' if is_present else 'Non'}</div>
+                <div style="margin-top:0.25rem;color:#334155;"><b>Sentiment :</b> {sentiment}</div>
+                <div style="margin-top:0.25rem;color:#334155;"><b>Confiance :</b> {confidence}</div>
+                <div style="margin-top:0.7rem;color:#475569;line-height:1.5;">{action}</div>
             </div>
             """,
             unsafe_allow_html=True,
         )
 
-    with st.expander("Voir le payload JSON"):
-        st.json(result)
-    st.markdown("</div>", unsafe_allow_html=True)
+
+
+def render_dataset_preview(df_demo: pd.DataFrame) -> None:
+    preview_cols = [c for c in ["review_id", "review_title", "review_body", "sentiment_fr", "theme_livraison", "theme_sav", "theme_produit"] if c in df_demo.columns]
+    st.dataframe(df_demo[preview_cols].head(20), use_container_width=True, height=420)
 
 
 
-def render_architecture_block() -> None:
-    st.markdown(
-        """
-        <div class="glass-card">
-            <div class="section-title">Architecture cible</div>
-            <div style="font-size: 1.08rem; color: #f4f7fb; line-height: 1.7;">
-                1. Entrée texte ou batch CSV.<br>
-                2. Détection multi-label des thèmes métier.<br>
-                3. Sentiment conditionné par thème détecté.<br>
-                4. Guardrails de confiance et file de revue humaine.<br>
-                5. Sorties dashboard, alerting, export JSON/CSV et API-ready.
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
+def build_dashboard_from_uploaded(df_demo: pd.DataFrame) -> Dict[str, pd.DataFrame]:
+    sentiment_counts = df_demo["sentiment_fr"].value_counts().rename_axis("sentiment").to_frame("count")
+    theme_counts = pd.DataFrame(
+        {
+            "thème": ["Livraison", "SAV", "Produit"],
+            "volume": [
+                int(df_demo["theme_livraison"].sum()),
+                int(df_demo["theme_sav"].sum()),
+                int(df_demo["theme_produit"].sum()),
+            ],
+        }
     )
+    return {
+        "sentiment_counts": sentiment_counts,
+        "theme_counts": theme_counts,
+    }
 
 
 
@@ -582,270 +634,140 @@ def run_streamlit_app() -> None:
 
     configure_page()
     inject_styles()
-    render_header()
+
+    df_raw = load_poc_dataset()
+    df_demo = prepare_demo_dataset(df_raw)
+    text_col = find_text_column(df_demo)
+    id_col = find_id_column(df_demo)
+    dashboard = build_dashboard_from_uploaded(df_demo)
 
     with st.sidebar:
-        st.markdown("## Command Center")
-        threshold = st.slider("Seuil de détection thème", 0.30, 0.90, DEFAULT_CONFIDENCE_THRESHOLD, 0.05)
-        st.markdown("### Modules activés")
-        st.write("- Détection thèmes")
-        st.write("- Sentiment")
-        st.write("- Alertes métier")
-        st.write("- Export JSON / CSV")
-        st.markdown("### Taxonomie")
-        st.write("- Livraison")
-        st.write("- SAV")
-        st.write("- Produit")
-        st.markdown("### Positionnement")
-        st.caption(
-            "Cette V2 privilégie une expérience direction produit / innovation, avec une UI premium et une structure plus prête pour une future industrialisation."
-        )
+        st.markdown("## Paramètres du POC")
+        threshold = st.slider("Seuil de détection des thèmes", 0.30, 0.90, DEFAULT_CONFIDENCE_THRESHOLD, 0.05)
+        st.markdown("### Dataset utilisé")
+        st.caption("Le fichier chargé pour le POC alimente la démonstration, les exemples et le dashboard.")
+        st.write(f"- Fichier détecté : {'Oui' if os.path.exists(DATASET_PATH) else 'Non'}")
+        st.write(f"- Colonne texte : {text_col}")
+        st.write(f"- Colonne ID : {id_col or 'générée'}")
+        st.markdown("### Logique métier")
+        st.write("- Détection des thèmes")
+        st.write("- Sentiment associé")
+        st.write("- File de revue humaine")
+        st.write("- Export opérationnel")
 
-    summary_results = analyze_dataframe(build_sample_data(), text_col="review_text", id_col="review_id", threshold=threshold)
-    summary_export = flatten_export(summary_results)
+    render_header(df_demo)
 
-    hero_c1, hero_c2, hero_c3, hero_c4 = st.columns(4)
-    with hero_c1:
-        mini_kpi("Avis monitorés", str(len(summary_results)))
-    with hero_c2:
-        mini_kpi("Alertes critiques", str(int((summary_export["sentiment"] == "négatif").sum())))
-    with hero_c3:
-        mini_kpi("Human review", str(int(summary_results["needs_human_review"].sum())))
-    with hero_c4:
-        mini_kpi("Score moyen", f"{summary_results['score_global'].mean():.2f}")
-
-    tab1, tab2, tab3, tab4 = st.tabs(
-        ["Analyse premium", "Batch Studio", "Executive Dashboard", "Architecture & API"]
-    )
+    tab1, tab2, tab3 = st.tabs(["Analyse instantanée", "Commentaires du fichier", "Dashboard POC"])
 
     with tab1:
-        left, right = st.columns([1.25, 0.75])
+        left, right = st.columns([1.18, 0.82])
         with left:
-            st.markdown('<div class="glass-card">', unsafe_allow_html=True)
-            st.markdown("### Analyse unitaire")
-            sample_text = st.text_area(
-                "Collez un avis client",
-                value="J'ai un problème avec la livraison, le carton était abîmé. Le service client n'a pas pu m'aider rapidement.",
-                height=170,
-            )
-            review_id = st.text_input("ID avis", value="demo_001")
-            run_single = st.button("Analyser l'avis", type="primary", use_container_width=True)
-            st.markdown("</div>", unsafe_allow_html=True)
+            st.markdown('<div class="surface-card">', unsafe_allow_html=True)
+            st.markdown('<div class="section-title">Tapez ou collez un commentaire</div>', unsafe_allow_html=True)
+            st.markdown('<div class="helper">Le résultat se met à jour directement, sans bouton.</div>', unsafe_allow_html=True)
+
+            example_options = [""]
+            if text_col in df_demo.columns:
+                sample_texts = df_demo[text_col].dropna().astype(str).head(12).tolist()
+                example_options += sample_texts
+            selected_example = st.selectbox("Charger un exemple du fichier", options=example_options, index=0)
+            default_text = selected_example if selected_example else "The delivery was late and the support team did not help me."
+            live_text = st.text_area("Commentaire client", value=default_text, height=220)
+            review_id = st.text_input("ID du commentaire", value="demo_live_001")
+            st.markdown('</div>', unsafe_allow_html=True)
+
         with right:
+            result = analyze_review(live_text, review_id, threshold=threshold)
+            render_analysis_summary(result)
+            st.markdown('<div class="surface-card">', unsafe_allow_html=True)
+            st.markdown('<div class="section-title">Lecture rapide</div>', unsafe_allow_html=True)
             st.markdown(
-                """
-                <div class="glass-card">
-                    <div class="section-title">Signal design</div>
-                    <div style="font-size: 1.05rem; color: #ffffff; font-weight: 700; margin-bottom: 0.45rem;">Ce que montre cette vue</div>
-                    <div class="subtle">Une lecture rapide d'un avis avec niveau de confiance, thèmes détectés et recommandation métier directement exploitable en POC client ou comité produit.</div>
-                </div>
-                """,
+                "<div class='helper'>Cette vue répond à la logique de la présentation : quels thèmes sont touchés et avec quel sentiment, pour aboutir à une action opérationnelle claire.</div>",
                 unsafe_allow_html=True,
             )
-            positive_count = int((summary_export["sentiment"] == "positif").sum())
-            negative_count = int((summary_export["sentiment"] == "négatif").sum())
-            neutral_count = int(summary_export["sentiment"].fillna("neutre").eq("neutre").sum())
-            st.markdown('<div class="glass-card">', unsafe_allow_html=True)
-            st.markdown("### Snapshot")
-            metric_card("Positifs", positive_count)
-            metric_card("Négatifs", negative_count)
-            metric_card("Neutres", neutral_count)
-            st.markdown("</div>", unsafe_allow_html=True)
+            if result["needs_human_review"]:
+                st.warning("Cet avis mérite une revue humaine pour sécuriser la décision métier.")
+            else:
+                st.success("Le signal est suffisamment clair pour une lecture métier rapide.")
+            st.markdown('</div>', unsafe_allow_html=True)
 
-        if run_single:
-            result = analyze_review(sample_text, review_id, threshold=threshold)
-            render_single_result(result)
+        render_theme_cards(result)
+
+        with st.expander("Voir le JSON du POC"):
+            st.json(result)
 
     with tab2:
-        st.markdown('<div class="glass-card">', unsafe_allow_html=True)
-        st.markdown("### Batch Studio")
-        uploaded_file = st.file_uploader("Uploader un CSV", type=["csv"])
-        use_sample = st.checkbox("Utiliser un jeu d'exemple", value=True)
-        st.markdown("</div>", unsafe_allow_html=True)
+        st.markdown('<div class="surface-card">', unsafe_allow_html=True)
+        st.markdown('<div class="section-title">Jeu de données utilisé pour le POC</div>', unsafe_allow_html=True)
+        st.markdown('<div class="helper">Aperçu des commentaires et des labels déjà présents dans le fichier fourni.</div>', unsafe_allow_html=True)
+        render_dataset_preview(df_demo)
+        st.markdown('</div>', unsafe_allow_html=True)
 
-        source_df = None
-        if uploaded_file is not None:
-            try:
-                source_df = safe_read_csv_filelike(uploaded_file)
-            except Exception as exc:
-                st.error(f"Impossible de lire le CSV : {exc}")
-        elif use_sample:
-            source_df = build_sample_data()
-
-        if source_df is not None and not source_df.empty:
-            preview_col, control_col = st.columns([1.3, 0.7])
-            with preview_col:
-                st.markdown('<div class="glass-card">', unsafe_allow_html=True)
-                st.markdown("### Aperçu des données")
-                st.dataframe(source_df, use_container_width=True, height=320)
-                st.markdown("</div>", unsafe_allow_html=True)
-            with control_col:
-                st.markdown('<div class="glass-card">', unsafe_allow_html=True)
-                st.markdown("### Mapping des colonnes")
-                default_text_index = 1 if len(source_df.columns) > 1 else 0
-                text_col = st.selectbox("Colonne contenant les avis", options=list(source_df.columns), index=default_text_index)
-                id_index = list(source_df.columns).index("review_id") + 1 if "review_id" in source_df.columns else 0
-                id_col = st.selectbox("Colonne ID (optionnel)", options=[""] + list(source_df.columns), index=id_index)
-                run_batch = st.button("Lancer l'analyse batch", use_container_width=True, type="primary")
-                st.markdown("</div>", unsafe_allow_html=True)
-
-            if run_batch:
-                results_df = analyze_dataframe(source_df, text_col=text_col, id_col=id_col or None, threshold=threshold)
-                export_df = flatten_export(results_df)
-                st.session_state["results_df"] = results_df
-                st.session_state["export_df"] = export_df
-                st.success("Analyse batch terminée.")
-
-        if "results_df" in st.session_state:
-            results_df = st.session_state["results_df"]
-            export_df = st.session_state["export_df"]
-            st.markdown('<div class="glass-card">', unsafe_allow_html=True)
-            st.markdown("### Résultats enrichis")
-            st.dataframe(export_df, use_container_width=True, height=320)
-
-            dl1, dl2 = st.columns(2)
-            with dl1:
-                st.download_button(
-                    label="Télécharger CSV enrichi",
-                    data=export_df.to_csv(index=False).encode("utf-8"),
-                    file_name="review_insights_export_v2.csv",
-                    mime="text/csv",
-                    use_container_width=True,
-                )
-            with dl2:
-                st.download_button(
-                    label="Télécharger JSON",
-                    data=results_df.to_json(orient="records", force_ascii=False, indent=2),
-                    file_name="review_insights_payload_v2.json",
-                    mime="application/json",
-                    use_container_width=True,
-                )
-            st.markdown("</div>", unsafe_allow_html=True)
+        st.markdown('<div class="surface-card">', unsafe_allow_html=True)
+        st.markdown('<div class="section-title">Ré-analyser le fichier avec la logique POC</div>', unsafe_allow_html=True)
+        results_df = analyze_dataframe(df_demo, text_col=text_col, id_col=id_col, threshold=threshold)
+        export_df = flatten_export(results_df)
+        st.dataframe(export_df.head(50), use_container_width=True, height=420)
+        col_a, col_b = st.columns(2)
+        with col_a:
+            st.download_button(
+                label="Télécharger le CSV enrichi",
+                data=export_df.to_csv(index=False).encode("utf-8"),
+                file_name="poc_analyse_commentaires.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+        with col_b:
+            st.download_button(
+                label="Télécharger le JSON du POC",
+                data=results_df.to_json(orient="records", force_ascii=False, indent=2),
+                file_name="poc_analyse_commentaires.json",
+                mime="application/json",
+                use_container_width=True,
+            )
+        st.markdown('</div>', unsafe_allow_html=True)
 
     with tab3:
-        if "results_df" not in st.session_state:
-            st.session_state["results_df"] = summary_results
-            st.session_state["export_df"] = summary_export
+        c1, c2 = st.columns([1, 1])
+        with c1:
+            st.markdown('<div class="surface-card">', unsafe_allow_html=True)
+            st.markdown('<div class="section-title">Répartition par thème dans le fichier</div>', unsafe_allow_html=True)
+            st.bar_chart(dashboard["theme_counts"].set_index("thème"))
+            st.markdown('</div>', unsafe_allow_html=True)
+        with c2:
+            st.markdown('<div class="surface-card">', unsafe_allow_html=True)
+            st.markdown('<div class="section-title">Répartition des sentiments du fichier</div>', unsafe_allow_html=True)
+            st.bar_chart(dashboard["sentiment_counts"])
+            st.markdown('</div>', unsafe_allow_html=True)
 
-        results_df = st.session_state["results_df"]
-        export_df = st.session_state["export_df"]
-
-        top_left, top_right = st.columns([1.05, 0.95])
-        with top_left:
-            st.markdown('<div class="glass-card">', unsafe_allow_html=True)
-            st.markdown("### Executive KPIs")
-            k1, k2, k3, k4 = st.columns(4)
-            with k1:
-                metric_card("Avis analysés", len(results_df))
-            with k2:
-                metric_card("Alertes négatives", int((export_df["sentiment"] == "négatif").sum()))
-            with k3:
-                metric_card("Revue humaine", int(results_df["needs_human_review"].sum()))
-            with k4:
-                metric_card("Score moyen", round(results_df["score_global"].mean(), 2))
-            st.markdown("</div>", unsafe_allow_html=True)
-
-            st.markdown('<div class="glass-card">', unsafe_allow_html=True)
-            st.markdown("### Répartition par thème")
-            theme_counts = pd.DataFrame(
-                {
-                    "theme": list(THEMES.keys()),
-                    "count": [int(results_df[f"theme_{theme}"].sum()) for theme in THEMES],
-                }
+        if "review_body" in df_demo.columns:
+            alert_mask = (
+                (df_demo.get("theme_livraison", 0) == 1)
+                | (df_demo.get("theme_sav", 0) == 1)
+                | (df_demo.get("theme_produit", 0) == 1)
             )
-            st.bar_chart(theme_counts.set_index("theme"))
-            st.markdown("</div>", unsafe_allow_html=True)
-
-        with top_right:
-            st.markdown('<div class="glass-card">', unsafe_allow_html=True)
-            st.markdown("### Répartition des sentiments")
-            sentiment_counts = (
-                export_df["sentiment"].fillna("non classé").value_counts().rename_axis("sentiment").to_frame("count")
-            )
-            st.bar_chart(sentiment_counts)
-            st.markdown("</div>", unsafe_allow_html=True)
-
-            st.markdown('<div class="glass-card">', unsafe_allow_html=True)
-            st.markdown("### Alert queue")
-            alerts_df = export_df[
-                (export_df["sentiment"] == "négatif") | (export_df["needs_human_review"] == True)
-            ].copy()
-            alerts_df = alerts_df.sort_values(by=["needs_human_review", "confidence"], ascending=[False, True])
-            st.dataframe(alerts_df, use_container_width=True, height=300)
-            st.markdown("</div>", unsafe_allow_html=True)
-
-    with tab4:
-        left, right = st.columns([1.05, 0.95])
-        with left:
-            render_architecture_block()
-        with right:
-            st.markdown(
-                """
-                <div class="glass-card">
-                    <div class="section-title">API payload preview</div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-            st.code(
-                json.dumps(
-                    {
-                        "review_id": "12345",
-                        "themes_detected": ["livraison", "sav"],
-                        "insights": [
-                            {
-                                "topic": "livraison",
-                                "sentiment": "négatif",
-                                "actionable_text": "Prioriser une alerte logistique.",
-                            },
-                            {
-                                "topic": "sav",
-                                "sentiment": "négatif",
-                                "actionable_text": "Escalader au support client.",
-                            },
-                        ],
-                        "score_global": 0.74,
-                        "needs_human_review": True,
-                        "model_version": "poc-rules-v2-premium-ui",
-                    },
-                    ensure_ascii=False,
-                    indent=2,
-                ),
-                language="json",
-            )
-            st.markdown(
-                """
-                <div class="glass-card">
-                    <div class="section-title">Roadmap</div>
-                    <div class="subtle">Étape suivante : brancher un backend FastAPI, substituer le moteur de règles par un classifieur multi-label Hugging Face et exposer des endpoints batch/inference temps réel.</div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-
-    st.markdown(
-        """
-        <div class="footer-note">
-            V2 premium conçue pour une démo plus crédible en rendez-vous client, comité innovation ou validation de MVP data/IA.
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+            alert_cols = [c for c in ["review_id", "review_body", "sentiment_fr", "theme_livraison", "theme_sav", "theme_produit"] if c in df_demo.columns]
+            st.markdown('<div class="surface-card">', unsafe_allow_html=True)
+            st.markdown('<div class="section-title">Commentaires à fort intérêt métier</div>', unsafe_allow_html=True)
+            st.dataframe(df_demo.loc[alert_mask, alert_cols].head(30), use_container_width=True, height=360)
+            st.markdown('</div>', unsafe_allow_html=True)
 
 
-
+# =========================
+# MODE CLI DE SECOURS
+# =========================
 def run_cli_demo() -> None:
-    print("Streamlit n'est pas installé. Exécution du mode CLI de secours.\n")
-    demo_result = analyze_review(
-        "La livraison est arrivée en retard et le carton était abîmé.",
-        "demo_cli_001",
-        threshold=DEFAULT_CONFIDENCE_THRESHOLD,
-    )
-    print(json.dumps(demo_result, ensure_ascii=False, indent=2))
-    print("\nPour lancer l'interface web, installez Streamlit puis exécutez :")
-    print("streamlit run review_insights_poc_streamlit_app.py")
+    df_raw = load_poc_dataset()
+    df_demo = prepare_demo_dataset(df_raw)
+    text_col = find_text_column(df_demo)
+    review_text = str(df_demo[text_col].iloc[0]) if len(df_demo) else "The delivery was late and damaged."
+    print("Streamlit n'est pas installé. Exécution du mode CLI du POC.\n")
+    print(json.dumps(analyze_review(review_text, "demo_cli_001"), ensure_ascii=False, indent=2))
 
 
+# =========================
+# TESTS
+# =========================
 class ReviewInsightsTests(unittest.TestCase):
     def test_normalize_text_collapses_spaces(self):
         self.assertEqual(normalize_text("  Bonjour   le   monde  "), "bonjour le monde")
@@ -862,6 +784,10 @@ class ReviewInsightsTests(unittest.TestCase):
     def test_analyze_review_returns_autre_when_no_theme(self):
         result = analyze_review("Très bien", "r1")
         self.assertEqual(result["insights"][0]["topic"], "autre")
+
+    def test_analyze_review_exposes_global_sentiment(self):
+        result = analyze_review("excellent produit", "r2")
+        self.assertIn("global_sentiment", result)
 
     def test_analyze_dataframe_generates_default_ids(self):
         df = pd.DataFrame({"text": ["excellent produit", "service client lent"]})
@@ -885,12 +811,21 @@ class ReviewInsightsTests(unittest.TestCase):
         self.assertEqual(df.columns.tolist(), ["review_id", "review_text"])
         self.assertEqual(df.iloc[0]["review_id"], "R-1")
 
-    def test_cli_demo_returns_none(self):
-        self.assertIsNone(run_cli_demo())
+    def test_find_text_column_prefers_review_body(self):
+        df = pd.DataFrame({"review_body": ["a"], "text": ["b"]})
+        self.assertEqual(find_text_column(df), "review_body")
 
-    def test_detect_themes_respects_high_threshold(self):
-        result = detect_themes("support", 0.95)
-        self.assertEqual(result["sav"].present, 0)
+    def test_prepare_demo_dataset_adds_missing_theme_columns(self):
+        df = pd.DataFrame({"review_text": ["abc"]})
+        prepared = prepare_demo_dataset(df)
+        self.assertIn("theme_livraison", prepared.columns)
+        self.assertIn("theme_sav", prepared.columns)
+        self.assertIn("theme_produit", prepared.columns)
+
+    def test_load_poc_dataset_returns_dataframe(self):
+        df = load_poc_dataset()
+        self.assertIsInstance(df, pd.DataFrame)
+        self.assertGreater(len(df), 0)
 
 
 if __name__ == "__main__":
@@ -900,3 +835,4 @@ if __name__ == "__main__":
         run_cli_demo()
     else:
         run_streamlit_app()
+
