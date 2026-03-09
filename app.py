@@ -22,49 +22,19 @@ HUMAN_REVIEW_THRESHOLD = 0.45
 
 THEMES = {
     "livraison": [
-        "livraison",
-        "delivery",
-        "retard",
-        "late",
-        "colis",
-        "package",
-        "carton",
-        "expédition",
-        "shipping",
-        "arrivé",
-        "arrive",
-        "transport",
-        "reçu",
+        "livraison", "delivery", "deliver", "delivered", "shipping", "shipment", "ship",
+        "shipped", "arrived", "arrive", "arrival", "late", "delay", "delayed",
+        "retard", "colis", "package", "parcel", "box", "carton", "transport", "received"
     ],
     "sav": [
-        "sav",
-        "service client",
-        "support",
-        "customer service",
-        "help",
-        "assistance",
-        "remboursement",
-        "refund",
-        "retour",
-        "return",
-        "réponse",
-        "response",
+        "sav", "service client", "customer service", "customer support", "support", "help",
+        "assistance", "refund", "refunded", "reimbursement", "return", "returned", "exchange",
+        "response", "respond", "answered", "reply", "warranty", "guarantee", "seller", "contact"
     ],
     "produit": [
-        "produit",
-        "product",
-        "qualité",
-        "quality",
-        "cassé",
-        "broken",
-        "défectueux",
-        "defective",
-        "taille",
-        "size",
-        "matière",
-        "material",
-        "couleur",
-        "color",
+        "produit", "product", "quality", "qualité", "broken", "broke", "damaged", "defective",
+        "defect", "size", "small", "large", "fit", "material", "fabric", "color", "colour",
+        "scratchy", "thin", "loose", "cheap", "sturdy", "beautiful", "cute", "design"
     ],
 }
 
@@ -137,15 +107,26 @@ def normalize_text(text: str) -> str:
 
 
 def keyword_hits(text: str, keywords: List[str]) -> int:
-    return sum(1 for keyword in keywords if keyword in text)
+    text = normalize_text(text)
+    score = 0
+    for keyword in keywords:
+        kw = normalize_text(keyword)
+        if " " in kw:
+            if kw in text:
+                score += 2
+        else:
+            if re.search(rf"\b{re.escape(kw)}\w*\b", text):
+                score += 1
+    return score
 
 
 
 def detect_themes(text: str, threshold: float) -> Dict[str, ThemeResult]:
     results: Dict[str, ThemeResult] = {}
+    normalized = normalize_text(text)
     for theme, keywords in THEMES.items():
-        hits = keyword_hits(text, keywords)
-        confidence = min(0.2 + hits * 0.22, 0.98) if hits > 0 else 0.08
+        hits = keyword_hits(normalized, keywords)
+        confidence = min(0.18 + hits * 0.16, 0.98) if hits > 0 else 0.05
         present = int(confidence >= threshold)
         results[theme] = ThemeResult(present=present, sentiment=None, confidence=round(confidence, 2))
     return results
@@ -675,7 +656,7 @@ def run_streamlit_app() -> None:
     with st.sidebar:
         st.markdown("## Paramètres du POC")
         uploaded_file = st.file_uploader("Importer un dataset CSV", type=["csv"])
-        threshold = st.slider("Seuil de détection des thèmes", 0.30, 0.90, DEFAULT_CONFIDENCE_THRESHOLD, 0.05)
+        threshold = st.slider("Seuil de détection des thèmes", 0.20, 0.90, 0.35, 0.05)
 
         df_raw = load_uploaded_or_default_dataset(uploaded_file)
         df_demo = prepare_demo_dataset(df_raw)
@@ -856,8 +837,20 @@ class ReviewInsightsTests(unittest.TestCase):
         self.assertEqual(normalize_text("  Bonjour   le   monde  "), "bonjour le monde")
 
     def test_detect_themes_finds_livraison(self):
-        result = detect_themes("livraison en retard avec colis abîmé", 0.60)
+        result = detect_themes("livraison en retard avec colis abîmé", 0.35)
         self.assertEqual(result["livraison"].present, 1)
+
+    def test_detect_themes_finds_delivery_in_english(self):
+        result = detect_themes("the delivery was late and the package arrived damaged", 0.35)
+        self.assertEqual(result["livraison"].present, 1)
+
+    def test_detect_themes_finds_customer_support_in_english(self):
+        result = detect_themes("customer support never answered my refund request", 0.35)
+        self.assertEqual(result["sav"].present, 1)
+
+    def test_detect_themes_finds_product_issue_in_english(self):
+        result = detect_themes("the product is beautiful but the material feels cheap and thin", 0.35)
+        self.assertEqual(result["produit"].present, 1)
 
     def test_score_sentiment_negative(self):
         sentiment, confidence = score_sentiment("retard cassé mauvais")
