@@ -733,8 +733,7 @@ def run_streamlit_app() -> None:
         selected_lookup = {}
         for idx, row in filtered_df.iterrows():
             rid = str(row[id_col]) if id_col and id_col in filtered_df.columns else f"row_{idx + 1}"
-            preview = str(row[text_col])[:100].replace("
-", " ")
+            preview = str(row[text_col])[:100].replace("\n", " ")
             label = f"{rid} — {preview}"
             selection_options.append(label)
             selected_lookup[label] = row
