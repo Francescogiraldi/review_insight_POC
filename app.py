@@ -375,8 +375,12 @@ def prepare_demo_dataset(df: pd.DataFrame) -> pd.DataFrame:
     prepared = df.copy()
     if "review_body" not in prepared.columns and "review_text" in prepared.columns:
         prepared["review_body"] = prepared["review_text"]
+    if "review_body" not in prepared.columns and "text" in prepared.columns:
+        prepared["review_body"] = prepared["text"]
     if "review_title" not in prepared.columns:
         prepared["review_title"] = ""
+    if "review_id" not in prepared.columns:
+        prepared["review_id"] = [f"review_{i+1}" for i in range(len(prepared))]
     if "sent_global" in prepared.columns:
         prepared["sentiment_fr"] = prepared["sent_global"].map(SENTIMENT_LABELS).fillna("neutre")
     else:
@@ -605,7 +609,7 @@ def render_theme_cards(result: Dict) -> None:
 
 def render_dataset_preview(df_demo: pd.DataFrame) -> None:
     preview_cols = [c for c in ["review_id", "review_title", "review_body", "sentiment_fr", "theme_livraison", "theme_sav", "theme_produit"] if c in df_demo.columns]
-    st.dataframe(df_demo[preview_cols].head(20), use_container_width=True, height=420)
+    st.dataframe(df_demo[preview_cols], use_container_width=True, height=700)
 
 
 
@@ -627,6 +631,39 @@ def build_dashboard_from_uploaded(df_demo: pd.DataFrame) -> Dict[str, pd.DataFra
     }
 
 
+def filter_dataset(df_demo: pd.DataFrame, query: str, sentiment_filter: str, theme_filter: str, text_col: str) -> pd.DataFrame:
+    filtered = df_demo.copy()
+
+    if query.strip():
+        q = query.strip().lower()
+        searchable_cols = [c for c in ["review_id", "review_title", text_col] if c in filtered.columns]
+        mask = pd.Series(False, index=filtered.index)
+        for col in searchable_cols:
+            mask = mask | filtered[col].fillna("").astype(str).str.lower().str.contains(q, regex=False)
+        filtered = filtered[mask]
+
+    if sentiment_filter != "Tous" and "sentiment_fr" in filtered.columns:
+        filtered = filtered[filtered["sentiment_fr"] == sentiment_filter]
+
+    theme_map = {
+        "Tous": None,
+        "Livraison": "theme_livraison",
+        "SAV": "theme_sav",
+        "Produit": "theme_produit",
+    }
+    theme_col = theme_map.get(theme_filter)
+    if theme_col and theme_col in filtered.columns:
+        filtered = filtered[filtered[theme_col] == 1]
+
+    return filtered.reset_index(drop=True)
+
+
+def load_uploaded_or_default_dataset(uploaded_file) -> pd.DataFrame:
+    if uploaded_file is not None:
+        return safe_read_csv_filelike(uploaded_file)
+    return load_poc_dataset()
+
+
 
 def run_streamlit_app() -> None:
     if st is None:
@@ -635,18 +672,33 @@ def run_streamlit_app() -> None:
     configure_page()
     inject_styles()
 
-    df_raw = load_poc_dataset()
-    df_demo = prepare_demo_dataset(df_raw)
-    text_col = find_text_column(df_demo)
-    id_col = find_id_column(df_demo)
-    dashboard = build_dashboard_from_uploaded(df_demo)
-
     with st.sidebar:
         st.markdown("## Paramètres du POC")
+        uploaded_file = st.file_uploader("Importer un dataset CSV", type=["csv"])
         threshold = st.slider("Seuil de détection des thèmes", 0.30, 0.90, DEFAULT_CONFIDENCE_THRESHOLD, 0.05)
+
+        df_raw = load_uploaded_or_default_dataset(uploaded_file)
+        df_demo = prepare_demo_dataset(df_raw)
+        available_columns = list(df_demo.columns)
+        detected_text_col = find_text_column(df_demo)
+        detected_id_col = find_id_column(df_demo)
+
+        text_col = st.selectbox(
+            "Colonne du commentaire à analyser",
+            options=available_columns,
+            index=available_columns.index(detected_text_col) if detected_text_col in available_columns else 0,
+        )
+        id_options = [""] + available_columns
+        id_default = id_options.index(detected_id_col) if detected_id_col in id_options else 0
+        id_col = st.selectbox("Colonne ID", options=id_options, index=id_default)
+        id_col = id_col or None
+
+        dashboard = build_dashboard_from_uploaded(df_demo)
+
         st.markdown("### Dataset utilisé")
-        st.caption("Le fichier chargé pour le POC alimente la démonstration, les exemples et le dashboard.")
-        st.write(f"- Fichier détecté : {'Oui' if os.path.exists(DATASET_PATH) else 'Non'}")
+        st.caption("Vous pouvez importer votre propre CSV. Le fichier importé alimente l'analyse, le tableau et le dashboard.")
+        st.write(f"- Source : {'CSV importé' if uploaded_file is not None else 'Dataset par défaut'}")
+        st.write(f"- Lignes : {len(df_demo)}")
         st.write(f"- Colonne texte : {text_col}")
         st.write(f"- Colonne ID : {id_col or 'générée'}")
         st.markdown("### Logique métier")
@@ -660,37 +712,68 @@ def run_streamlit_app() -> None:
     tab1, tab2, tab3 = st.tabs(["Analyse instantanée", "Commentaires du fichier", "Dashboard POC"])
 
     with tab1:
-        left, right = st.columns([1.18, 0.82])
-        with left:
-            st.markdown('<div class="surface-card">', unsafe_allow_html=True)
-            st.markdown('<div class="section-title">Tapez ou collez un commentaire</div>', unsafe_allow_html=True)
-            st.markdown('<div class="helper">Le résultat se met à jour directement, sans bouton.</div>', unsafe_allow_html=True)
+        st.markdown('<div class="surface-card">', unsafe_allow_html=True)
+        st.markdown('<div class="section-title">Analyse instantanée</div>', unsafe_allow_html=True)
+        st.markdown('<div class="helper">Écrivez un commentaire libre ou sélectionnez une ligne du dataset importé pour l’analyser immédiatement.</div>', unsafe_allow_html=True)
 
-            example_options = [""]
-            if text_col in df_demo.columns:
-                sample_texts = df_demo[text_col].dropna().astype(str).head(12).tolist()
-                example_options += sample_texts
-            selected_example = st.selectbox("Charger un exemple du fichier", options=example_options, index=0)
-            default_text = selected_example if selected_example else "The delivery was late and the support team did not help me."
-            live_text = st.text_area("Commentaire client", value=default_text, height=220)
-            review_id = st.text_input("ID du commentaire", value="demo_live_001")
-            st.markdown('</div>', unsafe_allow_html=True)
+        filter_col1, filter_col2, filter_col3 = st.columns([1.2, 0.8, 0.8])
+        with filter_col1:
+            search_query = st.text_input("Rechercher dans le dataset", value="")
+        with filter_col2:
+            sentiment_filter = st.selectbox("Filtrer par sentiment", options=["Tous", "positif", "négatif", "neutre"], index=0)
+        with filter_col3:
+            theme_filter = st.selectbox("Filtrer par thème", options=["Tous", "Livraison", "SAV", "Produit"], index=0)
+
+        filtered_df = filter_dataset(df_demo, search_query, sentiment_filter, theme_filter, text_col)
+        preview_cols = [c for c in [id_col, "review_title", text_col, "sentiment_fr"] if c and c in filtered_df.columns]
+        if preview_cols:
+            st.dataframe(filtered_df[preview_cols], use_container_width=True, height=380)
+
+        selection_options = ["Commentaire libre"]
+        selected_lookup = {}
+        for idx, row in filtered_df.iterrows():
+            rid = str(row[id_col]) if id_col and id_col in filtered_df.columns else f"row_{idx + 1}"
+            preview = str(row[text_col])[:100].replace("
+", " ")
+            label = f"{rid} — {preview}"
+            selection_options.append(label)
+            selected_lookup[label] = row
+
+        selected_source = st.selectbox("Choisir un commentaire du dataset", options=selection_options, index=0)
+        default_text = ""
+        default_review_id = "demo_live_001"
+        if selected_source != "Commentaire libre":
+            selected_row = selected_lookup[selected_source]
+            default_text = str(selected_row[text_col])
+            default_review_id = str(selected_row[id_col]) if id_col and id_col in filtered_df.columns else "demo_dataset_001"
+
+        left, right = st.columns([1.05, 0.95])
+        with left:
+            live_text = st.text_area(
+                "Commentaire client",
+                value=default_text,
+                height=220,
+                placeholder="Écrivez ici un commentaire ou utilisez une ligne du dataset importé.",
+            )
+            review_id = st.text_input("ID du commentaire", value=default_review_id)
 
         with right:
-            result = analyze_review(live_text, review_id, threshold=threshold)
+            effective_text = live_text if str(live_text).strip() else default_text
+            result = analyze_review(effective_text, review_id, threshold=threshold)
             render_analysis_summary(result)
             st.markdown('<div class="surface-card">', unsafe_allow_html=True)
             st.markdown('<div class="section-title">Lecture rapide</div>', unsafe_allow_html=True)
             st.markdown(
-                "<div class='helper'>Cette vue répond à la logique de la présentation : quels thèmes sont touchés et avec quel sentiment, pour aboutir à une action opérationnelle claire.</div>",
+                "<div class='helper'>Le commentaire sélectionné ou saisi est analysé immédiatement selon la logique du POC : thème, sentiment, confiance et action recommandée.</div>",
                 unsafe_allow_html=True,
             )
             if result["needs_human_review"]:
-                st.warning("Cet avis mérite une revue humaine pour sécuriser la décision métier.")
+                st.warning("Ce commentaire mérite une revue humaine pour sécuriser la décision métier.")
             else:
                 st.success("Le signal est suffisamment clair pour une lecture métier rapide.")
             st.markdown('</div>', unsafe_allow_html=True)
 
+        st.markdown('</div>', unsafe_allow_html=True)
         render_theme_cards(result)
 
         with st.expander("Voir le JSON du POC"):
@@ -698,16 +781,17 @@ def run_streamlit_app() -> None:
 
     with tab2:
         st.markdown('<div class="surface-card">', unsafe_allow_html=True)
-        st.markdown('<div class="section-title">Jeu de données utilisé pour le POC</div>', unsafe_allow_html=True)
-        st.markdown('<div class="helper">Aperçu des commentaires et des labels déjà présents dans le fichier fourni.</div>', unsafe_allow_html=True)
+        st.markdown('<div class="section-title">Dataset complet utilisé dans le POC</div>', unsafe_allow_html=True)
+        st.caption(f"Nombre total de lignes du fichier : {len(df_demo)}")
+        st.markdown('<div class="helper">Le CSV importé est visible ici en entier et sert aussi de base pour l’analyse instantanée.</div>', unsafe_allow_html=True)
         render_dataset_preview(df_demo)
         st.markdown('</div>', unsafe_allow_html=True)
 
         st.markdown('<div class="surface-card">', unsafe_allow_html=True)
-        st.markdown('<div class="section-title">Ré-analyser le fichier avec la logique POC</div>', unsafe_allow_html=True)
+        st.markdown('<div class="section-title">Ré-analyser tout le dataset avec la logique POC</div>', unsafe_allow_html=True)
         results_df = analyze_dataframe(df_demo, text_col=text_col, id_col=id_col, threshold=threshold)
         export_df = flatten_export(results_df)
-        st.dataframe(export_df.head(50), use_container_width=True, height=420)
+        st.dataframe(export_df, use_container_width=True, height=700)
         col_a, col_b = st.columns(2)
         with col_a:
             st.download_button(
@@ -827,6 +911,27 @@ class ReviewInsightsTests(unittest.TestCase):
         self.assertIsInstance(df, pd.DataFrame)
         self.assertGreater(len(df), 0)
 
+    def test_prepare_demo_dataset_generates_review_id(self):
+        df = pd.DataFrame({"review_body": ["abc"]})
+        prepared = prepare_demo_dataset(df)
+        self.assertIn("review_id", prepared.columns)
+        self.assertEqual(prepared.iloc[0]["review_id"], "review_1")
+
+    def test_filter_dataset_filters_text(self):
+        df = pd.DataFrame(
+            {
+                "review_id": ["1", "2"],
+                "review_body": ["late delivery", "great product"],
+                "sentiment_fr": ["négatif", "positif"],
+                "theme_livraison": [1, 0],
+                "theme_sav": [0, 0],
+                "theme_produit": [0, 1],
+            }
+        )
+        filtered = filter_dataset(df, "delivery", "Tous", "Tous", "review_body")
+        self.assertEqual(len(filtered), 1)
+        self.assertEqual(filtered.iloc[0]["review_id"], "1")
+
 
 if __name__ == "__main__":
     if "--test" in sys.argv:
@@ -835,4 +940,3 @@ if __name__ == "__main__":
         run_cli_demo()
     else:
         run_streamlit_app()
-
